@@ -37,19 +37,19 @@ import subprocess
 eps = np.finfo(np.float32).eps
 
 def get_device():
-    # Select the best available device
     if torch.cuda.is_available():
-        device = "cuda"
+        device = torch.device("cuda")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device = "mps"
+        device = torch.device("mps")
     else:
-        device = "cpu"
+        device = torch.device("cpu")
     print(f"Using device: {device}")
     return device
 
+
 def get_execution_provider(device: str):
     # Return appropriate ONNX Runtime execution provider
-    if device.startswith("cuda") and torch.cuda.is_available():
+    if device.type == "cuda" and torch.cuda.is_available():
         return ["CUDAExecutionProvider"]
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         # MPS doesn't use ONNX directly, fallback to CPU for now
@@ -61,7 +61,7 @@ def cuda_to_int(device: str) -> int:
     """
     Convert 'cuda:X' → int(X). For non-CUDA, return -1 (CPU/MPS safe)
     """
-    if device.startswith("cuda") and torch.cuda.is_available():
+    if device.type == "cuda" and torch.cuda.is_available():
         if ":" in device:
             return int(device.split(":")[1])
         return 0

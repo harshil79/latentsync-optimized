@@ -25,9 +25,13 @@ from DeepCache import DeepCacheSDHelper
 from latentsync.utils.util import get_device
 
 def main(config, args):
-
+    import torch
     device = get_device()
-
+    if (device == "mps" or device == "cuda"):
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    
     if not os.path.exists(args.video_path):
         raise RuntimeError(f"Video path '{args.video_path}' not found")
     if not os.path.exists(args.audio_path):
@@ -68,6 +72,29 @@ def main(config, args):
     )
 
     unet = unet.to(dtype=dtype)
+
+    # Enable fused attention kernels
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.set_float32_matmul_precision("high")
+        print("Enabled fused Flash/Math/MemEfficient attention backends.")
+    except Exception:
+        print("Skipped fused attention backend setup (not supported on this device).")
+
+    # Compile the UNet to fuse kernels
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True  # fallback to eager if compile fails
+
+    try:
+        unet.eval()
+        unet = torch.compile(unet, mode="reduce-overhead", fullgraph=False)
+        print("torch.compile() enabled (fallback-safe mode)")
+    except Exception as e:
+        print(f"torch.compile() skipped: {e}")
+
+
 
     pipeline = LipsyncPipeline(
         vae=vae,

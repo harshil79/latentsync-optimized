@@ -123,21 +123,22 @@ class AlignRestore(object):
         covariance = torch.matmul(points1_normalized.T, points2_normalized)
 
         # CPU fallback for non-CUDA / MPS devices
-        if str(DEVICE) == "mps":
-            print("affine_transform running with CPU fallback for unsupported MPS ops.")
-            covariance_cpu = covariance.float().to("cpu")
-            U, S, V = torch.svd(covariance_cpu)
-            R = torch.matmul(V, U.T)
-            det = torch.det(R)
-            R = R.to(self.device)
-        else:
-            U, S, V = torch.svd(covariance.float())
-            R = torch.matmul(V, U.T)
-            det = torch.det(R.float())
+        try:
+            U, S, Vh = torch.linalg.svd(covariance)
+            R = torch.matmul(Vh.T, U.T)
+        except RuntimeError as e:
+            print("SVD failed on MPS, falling back to CPU:", e)
+            U, S, Vh = torch.linalg.svd(covariance.cpu())
+            R = torch.matmul(Vh.T, U.T).to(self.device)
+        # else:
+        #     U, S, V = torch.svd(covariance.float())
+        #     R = torch.matmul(V, U.T)
+        #     det = torch.det(R.float())
+        det = torch.det(R)
 
         if det < 0:
-            V[:, -1] = -V[:, -1]
-            R = torch.matmul(V, U.T)
+            Vh[:, -1] = -Vh[:, -1]
+            R = torch.matmul(Vh, U.T)
 
         sR = (s2 / s1) * R
         T = c2.reshape(2, 1) - (s2 / s1) * torch.matmul(R, c1.reshape(2, 1))
