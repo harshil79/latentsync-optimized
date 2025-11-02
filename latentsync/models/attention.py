@@ -248,33 +248,55 @@ class Attention(nn.Module):
         return tensor
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
+        # Apply group normalization if defined
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
+        # Remember original device (cuda / mps / cpu)
+        orig_device = hidden_states.device
+
+        # Compute Q, K, V
         query = self.to_q(hidden_states)
         query = self.split_heads(query)
 
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
-
         key = self.split_heads(key)
         value = self.split_heads(value)
 
+        # Align attention mask if needed
         if attention_mask is not None:
-            if attention_mask.shape[-1] != query.shape[1]:
-                target_length = query.shape[1]
+            if attention_mask.shape[-1] != query.shape[2]:  # query shape: [B, H, L, Dh]
+                target_length = query.shape[2]
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
-        # Use PyTorch native implementation of FlashAttention-2
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
+        # Optimized Attention with CPU fallback for MPS
+        try:
+            # Normal path — runs fully on MPS/CUDA if available
+            attn_out = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
+        except RuntimeError as e:
+            # Handle only MPS memory limitation / unsupported op
+            if "Invalid buffer size" in str(e) or orig_device.type == "mps":
+                print("[WARN] Falling back to CPU for attention (MPS limitation)")
+                # Run the attention step on CPU
+                attn_out_cpu = F.scaled_dot_product_attention(
+                    query.to("cpu"),
+                    key.to("cpu"),
+                    value.to("cpu"),
+                    attn_mask=attention_mask.to("cpu") if attention_mask is not None else None,
+                )
+                # Move result back to original device to continue fast path
+                attn_out = attn_out_cpu.to(orig_device, non_blocking=True)
+            else:
+                raise
 
-        hidden_states = self.concat_heads(hidden_states)
-
-        # linear proj
+        # Merge heads and project output
+        hidden_states = self.concat_heads(attn_out)
         hidden_states = self.to_out[0](hidden_states)
-
-        # dropout
         hidden_states = self.to_out[1](hidden_states)
+
         return hidden_states
+
+

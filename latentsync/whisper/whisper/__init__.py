@@ -97,7 +97,11 @@ def load_model(
     """
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda" 
+        else: 
+            device = "cpu"
+    
     if download_root is None:
         download_root = os.getenv("XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache", "whisper"))
 
@@ -109,7 +113,9 @@ def load_model(
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
     with io.BytesIO(checkpoint_file) if in_memory else open(checkpoint_file, "rb") as fp:
-        checkpoint = torch.load(fp, map_location=device, weights_only=True)
+        map_location = torch.device(device if torch.cuda.is_available() else "cpu")
+        checkpoint = torch.load(fp, map_location=map_location)
+        #checkpoint = torch.load(fp, map_location=device, weights_only=True)
     del checkpoint_file
 
     dims = ModelDimensions(**checkpoint["dims"])

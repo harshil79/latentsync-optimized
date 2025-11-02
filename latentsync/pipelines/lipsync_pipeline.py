@@ -31,7 +31,7 @@ from einops import rearrange
 import cv2
 
 from ..models.unet import UNet3DConditionModel
-from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
+from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed,get_device
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
 import tqdm
@@ -42,6 +42,7 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 class LipsyncPipeline(DiffusionPipeline):
     _optional_components = []
+    #device_util = get_device()
 
     def __init__(
         self,
@@ -138,10 +139,54 @@ class LipsyncPipeline(DiffusionPipeline):
         return self.device
 
     def decode_latents(self, latents):
+        import torch
+
+        # Normalize latents
         latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        decoded_latents = self.vae.decode(latents).sample
-        return decoded_latents
+
+        try:
+            with torch.no_grad():
+                decoded = self.vae.decode(latents).sample
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "MPS backend" in str(e):
+                print("[WARN] MPS OOM detected during VAE decode — falling back to CPU...")
+
+                # Free up MPS cache
+                if torch.backends.mps.is_available():
+                    import torch.mps
+                    torch.mps.empty_cache()
+
+                # Save original device to move VAE back later
+                vae_device = next(self.vae.parameters()).device
+
+                # Move VAE to CPU
+                self.vae = self.vae.to("cpu")
+
+                # Move latents to CPU with proper dtype
+                latents_cpu = latents.to("cpu", dtype=torch.float32)
+
+                # Decode safely on CPU
+                with torch.no_grad():
+                    decoded = self.vae.decode(latents_cpu).sample
+
+                # Move VAE back to its original device (MPS)
+                self.vae = self.vae.to(vae_device)
+
+                # Move output back to original device for downstream ops
+                decoded = decoded.to(vae_device)
+
+            else:
+                raise
+
+        # Free any cached memory if running on MPS
+        if latents.device.type == "mps":
+            import torch.mps
+            torch.mps.empty_cache()
+
+        return decoded
+
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -182,7 +227,7 @@ class LipsyncPipeline(DiffusionPipeline):
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )  # (b, c, f, h, w)
-        rand_device = "cpu" if device.type == "mps" else device
+        rand_device = "cpu" if str(device) == "mps" else device
         latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype).to(device)
         latents = latents.repeat(1, 1, num_frames, 1, 1)
 
@@ -190,43 +235,93 @@ class LipsyncPipeline(DiffusionPipeline):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    def prepare_mask_latents(
-        self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance
-    ):
-        # resize the mask to latents shape as we concatenate the mask to the latents
-        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
-        # and half precision
+    def prepare_mask_latents(self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance):
+        import torch
+
+        # Resize mask to match VAE latent shape
         mask = torch.nn.functional.interpolate(
             mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
         )
         masked_image = masked_image.to(device=device, dtype=dtype)
 
-        # encode the mask image into latents space so we can concatenate it to the latents
-        masked_image_latents = self.vae.encode(masked_image).latent_dist.sample(generator=generator)
+        # --- Safe encode with fallback to CPU if MPS OOM ---
+        try:
+            masked_image_latents = self.vae.encode(masked_image).latent_dist.sample(generator=generator)
+        except RuntimeError as e:
+            if "mps" in str(e).lower() and "out of memory" in str(e).lower():
+                print("[WARN] MPS OOM during VAE encode (mask). Falling back to CPU...")
+                import torch.mps
+                torch.mps.empty_cache()
+
+                vae_device = next(self.vae.parameters()).device
+                self.vae = self.vae.to("cpu")
+
+                with torch.no_grad():
+                    masked_image_cpu = masked_image.to("cpu", dtype=torch.float32)
+                    masked_image_latents = self.vae.encode(masked_image_cpu).latent_dist.sample(generator=generator)
+
+                self.vae = self.vae.to(vae_device)
+                masked_image_latents = masked_image_latents.to(vae_device)
+            else:
+                raise
+
+        # Normalize encoded latents
         masked_image_latents = (masked_image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
-        # aligning device to prevent device errors when concating it with the latent model input
+        # Align devices
         masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
         mask = mask.to(device=device, dtype=dtype)
 
-        # assume batch size = 1
+        # Assume batch size = 1
         mask = rearrange(mask, "f c h w -> 1 c f h w")
         masked_image_latents = rearrange(masked_image_latents, "f c h w -> 1 c f h w")
 
-        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
-        masked_image_latents = (
-            torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
-        )
+        # Duplicate for classifier-free guidance
+        if do_classifier_free_guidance:
+            mask = torch.cat([mask] * 2)
+            masked_image_latents = torch.cat([masked_image_latents] * 2)
+
         return mask, masked_image_latents
 
+
     def prepare_image_latents(self, images, device, dtype, generator, do_classifier_free_guidance):
+        import torch
+
         images = images.to(device=device, dtype=dtype)
-        image_latents = self.vae.encode(images).latent_dist.sample(generator=generator)
+
+        # --- Safe encode with fallback to CPU if MPS OOM ---
+        try:
+            image_latents = self.vae.encode(images).latent_dist.sample(generator=generator)
+        except RuntimeError as e:
+            if "mps" in str(e).lower() and "out of memory" in str(e).lower():
+                print("[WARN] MPS OOM during VAE encode (image). Falling back to CPU...")
+                import torch.mps
+                torch.mps.empty_cache()
+
+                vae_device = next(self.vae.parameters()).device
+                self.vae = self.vae.to("cpu")
+
+                with torch.no_grad():
+                    images_cpu = images.to("cpu", dtype=torch.float32)
+                    image_latents = self.vae.encode(images_cpu).latent_dist.sample(generator=generator)
+
+                self.vae = self.vae.to(vae_device)
+                image_latents = image_latents.to(vae_device)
+            else:
+                raise
+
+        # Normalize encoded latents
         image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+
+        # Reshape for temporal structure (video)
         image_latents = rearrange(image_latents, "f c h w -> 1 c f h w")
-        image_latents = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
+
+        # Duplicate for classifier-free guidance
+        if do_classifier_free_guidance:
+            image_latents = torch.cat([image_latents] * 2)
 
         return image_latents
+
 
     def set_progress_bar_config(self, **kwargs):
         if not hasattr(self, "_progress_bar_config"):
@@ -337,9 +432,11 @@ class LipsyncPipeline(DiffusionPipeline):
         check_ffmpeg_installed()
 
         # 0. Define call parameters
-        device = self._execution_device
+        device = get_device()
+        print(f"LipsyncPipeline initialized on device: {self.device}")
+        # device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
+        self.image_processor = ImageProcessor(height, device=device, mask_image=mask_image)
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         # 1. Default height and width to unet
@@ -433,8 +530,9 @@ class LipsyncPipeline(DiffusionPipeline):
                     # concat latents, mask, masked_image_latents in the channel dimension
                     unet_input = torch.cat([unet_input, mask_latents, masked_image_latents, ref_latents], dim=1)
 
-                    # predict the noise residual
-                    noise_pred = self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
+                    # predict the noise residual (with mixed precision)
+                    with torch.autocast(device_type=device.type, dtype=weight_dtype):
+                        noise_pred = self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
 
                     # perform guidance
                     if do_classifier_free_guidance:

@@ -36,6 +36,36 @@ import subprocess
 # Machine epsilon for a float32 (single precision)
 eps = np.finfo(np.float32).eps
 
+def get_device():
+    # Select the best available device
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    print(f"Using device: {device}")
+    return device
+
+def get_execution_provider(device: str):
+    # Return appropriate ONNX Runtime execution provider
+    if device.startswith("cuda") and torch.cuda.is_available():
+        return ["CUDAExecutionProvider"]
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        # MPS doesn't use ONNX directly, fallback to CPU for now
+        return ["CPUExecutionProvider"]
+    else:
+        return ["CPUExecutionProvider"]
+
+def cuda_to_int(device: str) -> int:
+    """
+    Convert 'cuda:X' → int(X). For non-CUDA, return -1 (CPU/MPS safe)
+    """
+    if device.startswith("cuda") and torch.cuda.is_available():
+        if ":" in device:
+            return int(device.split(":")[1])
+        return 0
+    return -1
 
 def read_json(filepath: str):
     with open(filepath) as f:

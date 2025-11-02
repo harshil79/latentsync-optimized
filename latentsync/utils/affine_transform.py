@@ -5,7 +5,9 @@ import cv2
 import torch
 from einops import rearrange
 import kornia
+from latentsync.utils.util import get_device
 
+DEVICE = get_device()
 
 class AlignRestore(object):
     def __init__(self, align_points=3, resolution=256, device="cpu", dtype=torch.float16):
@@ -119,11 +121,20 @@ class AlignRestore(object):
         points2_normalized = points2_centered / s2
 
         covariance = torch.matmul(points1_normalized.T, points2_normalized)
-        U, S, V = torch.svd(covariance.float())
 
-        R = torch.matmul(V, U.T)
+        # CPU fallback for non-CUDA / MPS devices
+        if str(DEVICE) == "mps":
+            print("affine_transform running with CPU fallback for unsupported MPS ops.")
+            covariance_cpu = covariance.float().to("cpu")
+            U, S, V = torch.svd(covariance_cpu)
+            R = torch.matmul(V, U.T)
+            det = torch.det(R)
+            R = R.to(self.device)
+        else:
+            U, S, V = torch.svd(covariance.float())
+            R = torch.matmul(V, U.T)
+            det = torch.det(R.float())
 
-        det = torch.det(R.float())
         if det < 0:
             V[:, -1] = -V[:, -1]
             R = torch.matmul(V, U.T)

@@ -1,18 +1,24 @@
 from insightface.app import FaceAnalysis
 import numpy as np
 import torch
+from latentsync.utils.util import get_device, get_execution_provider, cuda_to_int
 
 INSIGHTFACE_DETECT_SIZE = 512
 
-
 class FaceDetector:
-    def __init__(self, device="cuda"):
+    def __init__(self, device=None):
+        
+        self.device = device or get_device()
+        provider = get_execution_provider(self.device)
+
+        print(f"Face Detection initialized --> Device: {self.device}, Provider: {provider}")
+
         self.app = FaceAnalysis(
             allowed_modules=["detection", "landmark_2d_106"],
             root="checkpoints/auxiliary",
-            providers=["CUDAExecutionProvider"],
+            providers=provider,
         )
-        self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
+        self.app.prepare(ctx_id=cuda_to_int(self.device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
 
     def __call__(self, frame, threshold=0.5):
         f_h, f_w, _ = frame.shape
@@ -67,19 +73,6 @@ class FaceDetector:
             y2 = min(f_h, y2)
 
             return (x1, y1, x2, y2), lmk
-
-
-def cuda_to_int(cuda_str: str) -> int:
-    """
-    Convert the string with format "cuda:X" to integer X.
-    """
-    if cuda_str == "cuda":
-        return 0
-    device = torch.device(cuda_str)
-    if device.type != "cuda":
-        raise ValueError(f"Device type must be 'cuda', got: {device.type}")
-    return device.index
-
 
 LMK_ADAPT_ORIGIN_ORDER = [
     1,
