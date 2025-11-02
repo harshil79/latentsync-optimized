@@ -127,7 +127,7 @@ class AlignRestore(object):
             U, S, Vh = torch.linalg.svd(covariance)
             R = torch.matmul(Vh.T, U.T)
         except RuntimeError as e:
-            print("SVD failed on MPS, falling back to CPU:", e)
+            print("SVD failed on MPS, falling back to CPU: ", e)
             U, S, Vh = torch.linalg.svd(covariance.cpu())
             R = torch.matmul(Vh.T, U.T).to(self.device)
         # else:

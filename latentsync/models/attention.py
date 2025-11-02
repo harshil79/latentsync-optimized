@@ -279,7 +279,7 @@ class Attention(nn.Module):
         except RuntimeError as e:
             # Handle only MPS memory limitation / unsupported op
             if "Invalid buffer size" in str(e) or orig_device.type == "mps":
-                print("[WARN] Falling back to CPU for attention (MPS limitation)")
+                print("Falling back to CPU for attention (MPS limitation)")
                 # Run the attention step on CPU
                 attn_out_cpu = F.scaled_dot_product_attention(
                     query.to("cpu"),

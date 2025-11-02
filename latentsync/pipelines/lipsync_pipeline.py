@@ -159,7 +159,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower() or "MPS backend" in str(e):
-                print("MPS OOM detected during VAE decode — falling back to CPU...")
+                print("MPS OOM detected during VAE decode — falling back to CPU")
 
                 if torch.backends.mps.is_available():
                     import torch.mps
@@ -252,7 +252,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
         except RuntimeError as e:
             if "mps" in str(e).lower() and "out of memory" in str(e).lower():
-                print("MPS OOM during VAE encode (mask). Falling back to CPU...")
+                print("MPS OOM during VAE encode (mask). Falling back to CPU")
                 import torch.mps
                 torch.mps.empty_cache()
 
@@ -267,7 +267,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 masked_image_latents = masked_image_latents.to(vae_device)
 
             elif "cuda" in str(e).lower() and "out of memory" in str(e).lower():
-                print("CUDA OOM during VAE encode (mask). Retrying with CPU fallback...")
+                print("CUDA OOM during VAE encode (mask). Retrying with CPU fallback")
                 torch.cuda.empty_cache()
 
                 vae_device = next(self.vae.parameters()).device
@@ -316,7 +316,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     image_latents = self.vae.encode(images).latent_dist.sample(generator=generator)
         except RuntimeError as e:
             if "mps" in str(e).lower() and "out of memory" in str(e).lower():
-                print("[WARN] MPS OOM during VAE encode (image). Falling back to CPU...")
+                print("MPS OOM during VAE encode (image). Falling back to CPU")
                 import torch.mps
                 torch.mps.empty_cache()
 
@@ -366,7 +366,7 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
-        print(f"Affine transforming {len(video_frames)} faces...")
+        print(f"Affine transforming {len(video_frames)} faces: ")
         for frame in tqdm.tqdm(video_frames):
             face, box, affine_matrix = self.image_processor.affine_transform(frame)
             faces.append(face)
@@ -379,7 +379,7 @@ class LipsyncPipeline(DiffusionPipeline):
     def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
         video_frames = video_frames[: len(faces)]
         out_frames = []
-        print(f"Restoring {len(faces)} faces...")
+        print(f"Restoring {len(faces)} faces: ")
         for index, face in enumerate(tqdm.tqdm(faces)):
             x1, y1, x2, y2 = boxes[index]
             height = int(y2 - y1)
@@ -582,8 +582,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 diff_val = float(local_difficulty.mean().item())
                 # 0.0 -> 1.0x, 1.0 -> 1.3x (tunable)
                 chunk_guidance_scale = guidance_scale * (1.0 + 0.3 * diff_val)
-            if i % 5 == 0:
-                print(f"[Adaptive] Chunk {i}: difficulty={diff_val:.3f}, guidance_scale={chunk_guidance_scale:.2f}")
+            if i % 1 == 0:
+                print(f"Adaptive Chunk {i}: difficulty={diff_val:.3f}, guidance_scale={chunk_guidance_scale:.2f}")
 
 
             # Prefetch next batch in background
