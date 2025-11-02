@@ -31,7 +31,7 @@ from einops import rearrange
 import cv2
 
 from ..models.unet import UNet3DConditionModel
-from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed,get_device
+from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed, get_device, compute_short_time_energy_from_wav, energy_to_difficulty
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
 import tqdm
@@ -475,12 +475,16 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
+        
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
+
+        # difficulty curve at 50Hz, then we will sample per video frame
+        energy_curve = compute_short_time_energy_from_wav(audio_path, frame_hz=50)
+        difficulty_curve = energy_to_difficulty(energy_curve)  # (T50,)
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
@@ -503,6 +507,16 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # Threaded data preparation
         def prepare_next(i):
+            # difficulty slice for these frames (aligned 1:1 with video fps)
+            start_f = i * num_frames
+            end_f = (i + 1) * num_frames
+            # difficulty is at 50Hz, but video is at 25fps -> just sample every 2nd
+            local_difficulty = None
+            if difficulty_curve is not None and len(difficulty_curve) > 0:
+                # take every 2nd energy frame to match 25fps
+                local_slice = difficulty_curve[0 : len(difficulty_curve) : 2]  # 50Hz -> 25Hz
+                local_difficulty = local_slice[start_f:end_f]  # (<= num_frames,)
+
             # Prepare all CPU-heavy inputs for inference i
             audio_embeds = None
             if self.unet.add_audio_layer:
@@ -538,7 +552,16 @@ class LipsyncPipeline(DiffusionPipeline):
                 do_classifier_free_guidance,
             )
 
-            return (audio_embeds, latents, mask_latents, masked_image_latents, masks, ref_pixel_values, ref_latents)
+            return (
+                audio_embeds,
+                latents,
+                mask_latents,
+                masked_image_latents,
+                masks,
+                ref_pixel_values,
+                ref_latents,
+                local_difficulty,
+            )
 
 
         # Use 2 threads (main GPU + 1 CPU worker)
@@ -549,7 +572,19 @@ class LipsyncPipeline(DiffusionPipeline):
 
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
             # Wait for current batch to be ready
-            audio_embeds, latents, mask_latents, masked_image_latents, masks, ref_pixel_values, ref_latents = future.result()
+            audio_embeds, latents, mask_latents, masked_image_latents, masks, ref_pixel_values, ref_latents, local_difficulty = future.result()
+            # from latentsync.utils.util import compute_audio_difficulty
+            # decide guidance_scale based on audio difficulty
+            # per-chunk guidance
+            chunk_guidance_scale = guidance_scale
+            if local_difficulty is not None and len(local_difficulty) > 0:
+                # e.g. average difficulty in this chunk
+                diff_val = float(local_difficulty.mean().item())
+                # 0.0 -> 1.0x, 1.0 -> 1.3x (tunable)
+                chunk_guidance_scale = guidance_scale * (1.0 + 0.3 * diff_val)
+            if i % 5 == 0:
+                print(f"[Adaptive] Chunk {i}: difficulty={diff_val:.3f}, guidance_scale={chunk_guidance_scale:.2f}")
+
 
             # Prefetch next batch in background
             if i + 1 < num_inferences:
@@ -570,7 +605,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
+                        noise_pred = noise_pred_uncond + chunk_guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
@@ -578,6 +613,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         progress_bar.update()
                         if callback is not None and j % callback_steps == 0:
                             callback(j, t, latents)
+
 
             # ---- Postprocess & decode ----
             decoded_latents = self.decode_latents(latents)

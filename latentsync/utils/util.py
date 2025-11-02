@@ -26,6 +26,8 @@ import torchvision
 import torch.distributed as dist
 from torchvision import transforms
 
+import soundfile as sf
+
 from einops import rearrange
 import cv2
 from decord import AudioReader, VideoReader
@@ -66,6 +68,40 @@ def cuda_to_int(device: str) -> int:
             return int(device.split(":")[1])
         return 0
     return -1
+
+def compute_short_time_energy_from_wav(audio_path: str, frame_hz: int = 50):
+    """
+    Returns energy per 1/frame_hz second, aligned with 50Hz whisper frames.
+    """
+    audio, sr = sf.read(audio_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    # samples per 20ms at 16kHz -> 320
+    win_size = int(sr / frame_hz)
+    hop_size = win_size
+    num_frames = (len(audio) + hop_size - 1) // hop_size
+    energy = []
+    for i in range(num_frames):
+        start = i * hop_size
+        end = min(len(audio), start + win_size)
+        segment = audio[start:end]
+        e = float(np.sum(segment * segment) / max(1, len(segment)))
+        energy.append(e)
+    energy = np.array(energy, dtype=np.float32)
+    # normalize 0..1
+    if energy.max() > 0:
+        energy = energy / energy.max()
+    return torch.from_numpy(energy)
+
+def energy_to_difficulty(energy: torch.Tensor, low=0.15, high=0.6):
+    """
+    Map raw energy (0..1) into difficulty (0..1).
+    low energy -> 0.1ish, speaking -> 0.7ish
+    """
+    energy = energy.clamp(0.0, 1.0)
+    diff = (energy - low) / max(1e-5, (high - low))
+    diff = diff.clamp(0.0, 1.0)
+    return diff
 
 def read_json(filepath: str):
     with open(filepath) as f:

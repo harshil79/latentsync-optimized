@@ -3,7 +3,7 @@
 # Step 1: Check for conda
 if ! command -v conda &> /dev/null; then
     echo "Conda not found." 
-    echo "Install Miniconda from https://docs.conda.io/en/latest/miniconda.html and try again."
+    echo "Install Anaconda/Miniconda."
     exit 1
 fi
 

@@ -26,30 +26,73 @@ class Audio2Feature:
 
     def get_sliced_feature(self, feature_array, vid_idx, fps=25):
         """
-        Get sliced features based on a given index
-        :param feature_array:
-        :param start_idx: the start index of the feature
-        :param audio_feat_length:
-        :return:
+        Return a window of whisper features around a video index.
+
+        feature_array: Tensor of shape (T, 2, 384) or (T, 384)
+        returns:
+            selected_feature: (W, 384)
+            selected_idx: list[int]
         """
-        length = len(feature_array)
-        selected_feature = []
+        length = feature_array.shape[0]
+        selected = []
         selected_idx = []
 
+        # original logic: audio is at 50 fps, video at 25 fps
         center_idx = int(vid_idx * 50 / fps)
         left_idx = center_idx - self.audio_feat_length[0] * 2
         right_idx = center_idx + (self.audio_feat_length[1] + 1) * 2
 
         for idx in range(left_idx, right_idx):
-            idx = max(0, idx)
-            idx = min(length - 1, idx)
-            x = feature_array[idx]
-            selected_feature.append(x)
+            # clamp
+            idx = max(0, min(length - 1, idx))
+            feat = feature_array[idx]   # could be (2,384) or (384,) or (1,2,384)
+
+            # normalize shape
+            # case 1: (2, 384) or (N, 384)
+            if feat.dim() == 2 and feat.size(-1) == self.embedding_dim:
+                pass  # fine
+            # case 2: (384,) -> make it (1, 384)
+            elif feat.dim() == 1 and feat.numel() == self.embedding_dim:
+                feat = feat.unsqueeze(0)
+            # case 3: anything else (very short / odd tensor) -> skip it
+            else:
+                # fall back to zeros to keep window size consistent
+                feat = torch.zeros(1, self.embedding_dim, device=feature_array.device, dtype=feature_array.dtype)
+
+            selected.append(feat)
             selected_idx.append(idx)
 
-        selected_feature = torch.cat(selected_feature, dim=0)
-        selected_feature = selected_feature.reshape(-1, self.embedding_dim)  # 50*384
+        # now concat along time
+        selected_feature = torch.cat(selected, dim=0)  # (W, 384)
+        # final safety: reshape to (-1, 384)
+        selected_feature = selected_feature.reshape(-1, self.embedding_dim)
+
         return selected_feature, selected_idx
+
+
+    def feature2chunks(self, feature_array, fps):
+        """
+        Turns the whole whisper feature stream into per-frame chunks
+        aligned to video fps.
+        """
+        whisper_chunks = []
+        whisper_idx_multiplier = 50.0 / fps
+        i = 0
+        print(f"video in {fps} FPS, audio idx in 50FPS")
+
+        while True:
+            start_idx = int(i * whisper_idx_multiplier)
+            selected_feature, selected_idx = self.get_sliced_feature(
+                feature_array=feature_array,
+                vid_idx=i,
+                fps=fps,
+            )
+            whisper_chunks.append(selected_feature)
+            i += 1
+            if start_idx > len(feature_array):
+                break
+
+        return whisper_chunks
 
     def get_sliced_feature_sparse(self, feature_array, vid_idx, fps=25):
         """
@@ -84,23 +127,6 @@ class Audio2Feature:
         selected_feature = selected_feature.reshape(-1, self.embedding_dim)  # 50*384
         selected_feature = torch.from_numpy(selected_feature)
         return selected_feature, selected_idx
-
-    def feature2chunks(self, feature_array, fps):
-        whisper_chunks = []
-        whisper_idx_multiplier = 50.0 / fps
-        i = 0
-        print(f"video in {fps} FPS, audio idx in 50FPS")
-
-        while True:
-            start_idx = int(i * whisper_idx_multiplier)
-            selected_feature, selected_idx = self.get_sliced_feature(feature_array=feature_array, vid_idx=i, fps=fps)
-            # print(f"i:{i},selected_idx {selected_idx}")
-            whisper_chunks.append(selected_feature)
-            i += 1
-            if start_idx > len(feature_array):
-                break
-
-        return whisper_chunks
 
     def _audio2feat(self, audio_path: str):
         # get the sample rate of the audio
